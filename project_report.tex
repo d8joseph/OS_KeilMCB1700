@@ -1,0 +1,582 @@
+\documentclass[12pt]{article}
+\usepackage[margin=0.8in]{geometry}
+\usepackage{amsmath}
+\usepackage{listings}
+\usepackage{graphicx}
+\usepackage{pdfpages}
+
+\renewcommand{\thepage}{\roman{page}}% Roman page numbers
+\setlength{\parskip}{7mm}
+
+\begin{document}
+\begin{titlepage}
+\center\Huge{\textbf{Keil LPC1768 Kernel Project Report}}
+{
+	\vfill
+\center {\noindent\large\textbf{
+	Daniel Joseph\\
+	\vspace{3mm}
+    Patrick Perrier\\
+    \vspace{3mm}
+    Balaji Sankaranarayanan\\
+   	\vspace{3mm}
+    Patrick Wrobel\\
+    }
+    \vfill
+    \textbf{\large{SE 350\\
+    April 4\textsuperscript{th}, 2015}}
+}
+}
+\end{titlepage}
+\newpage
+
+\tableofcontents
+\setcounter{page}{2}
+\newpage
+
+% Change it back to arabic numbering
+\renewcommand{\thepage}{\arabic{page}}% Roman page numbers
+\setcounter{page}{3}
+\section{Introduction}\label{intro}
+\subsection{Document Purpose}
+This document is intended to serve as the design overview for the operating system kernel that was created by us for the lab portion of the Winter 2016 Operating Systems course at the University of Waterloo. It provides the rationale behind the design choices that were made while implementing the kernel, and also provides explanations of the various sub-parts that make up the overall kernel and how they interact with each other. It is hoped that this document will provide the reader with a greater understanding of how our kernel works, and why it was designed the way that it is.
+
+\subsection{Document Layout}
+Not counting this introduction, this document contains eight sections. The first section details the global variables and \verb|#define|s that are present in the kernel code, as well as where, how, and why they are used. The second section explains the steps the kernel takes to initialize itself after the board is powered on or reset. The third section documents and explains the kernel API. The fourth section describes the different interrupts that can occur, and how these are handled by the kernel. The fifth section outlines the different user and system processes that get run by the kernel, and explains the priority system. The sixth section describes how we tested the kernel. The seventh section provides timing benchmarks for selected kernel functions and usage scenarios. Finally, the eighth and last section is a retrospective on the process of creating the kernel, including major design changes that were made, lessons learned, and what we might have done differently if we were to start over. The sections can be read in any order, though it is recommended to read them sequentially for the best flow of the document.
+\newpage
+\section{System Initialization}\label{init}
+Immediately after the board is turned on or reset, the kernel must do some initialization work before it is ready to run processes. A brief description of the steps that are taken follows. For more detail, please refer to the Kernel API documentation (section \ref{api}).
+
+Firstly, the UART\_0(interrupt) and UART\_1(polling) uart outputs are initialized to allow us to push messages to them and recieve interrupts from them. This is done by setting the appropriate bits on the board to allow us to recieve the messages.
+
+Next, the timer\_init is called, which intializes values for the timer, and based on the input parameters (0 or 1) sets the timer to use as well as how often to increment. When the parameter is 0, it resets every 1 seconds and triggers an interrupt on that, as well as uses LPC\_TIM0 for the clock. When the parameter is set to 1, it uses the LPC\_TIM1, does not reset the TC ever or interrupt, and increments every millisecond.
+
+Next, our pre\_process\_init is called. This takes all system process, priorities and locations, and adds them to our global process table. It takes every process in the system (including user\_procs) and gets the information for them, then adds them to the g\_proc\_table (global process table).
+
+Next, our memory\_init runs. We know how much memory is required for stacks as the pre\_process\_init has been called and added the stack requirements for each process to the g\_proc\_table. This function then goes through the remaining memory in increments of 0x80, creating a linked list with these blocks, and incrementing the counter in g\_mem\_list to add the memory blocks.
+
+Next, our process\_init runs, which actually allocates the stack, sets all process to have a status of READY and adds them to our ready queue.
+
+Finally, release\_processor is called to release the processor and allow other processes to run.
+
+\newpage
+\section{Global Variables and Constants}\label{globals}
+
+\subsubsection{MIN\_HEAP g\_blocked\_by\_memory\_heap}
+  This global variable stores all processes that are blocked on memory. It allows for releasing and requesting memory blocks to both add and remove from the table, and allows different processes to preempt if memory is released. The data structure for this is a min heap of processes, so that we can preempt more easily.
+
+\subsubsection{PCB * gp\_current\_process}
+  This global variable is a pointer to the current process that is running. This variable is required as many processes need to know what process is currently running, so that it can send messages, request memory block (and have ownership of it), as well as release the memory block it has only if it has ownership of it. The data structure that is used is just a pointer to a PCB (which contains all of the information for a process).
+
+\subsubsection{PCB ** gp\_pcbs}
+  This global variable is an array of all pcbs for every process on the system. This variable is required in order to perform context switches, check validity of processes as well as to add to message queues when sending a message, as the PCB contains a pointer to the list of messages waiting for it. The datastructure that is used for this is an array of pointers to PCB's.
+
+\subsubsection{PROC\_INIT[] g\_proc\_table}
+  This is an array of process data (PROC\_INIT) for each process running on the system , and each PROC\_INIT contains data such as start location of the process, stack size, priority and other important information. This information is used throughout kernel calls in order to check priority/preemtion when releasing memory or sending messages, as well as used to initialize each individiual process on system startup.
+
+\subsubsection{MEMORY\_LIST g\_mem\_list}
+  This is a list of the memory that is currently available in the system. The MEMORY\_LIST datatype contains an integer for the number of remaining memory blocks, as well as a pointer to the next available memory block (null if there is none). This is created and populated during system initilization, and is then used on request\_memory\_block and release\_memory\_block. This is necessary as it allows for checks on being blocked on memory, and because multiple kernel functions require access to it.
+
+\subsubsection{PROC\_INIT[] g\_test\_procs}
+  This is a list of all test processes that are running on the system (the ones that the user has created in user\_procs.c). This is required to be global, as it is set in user\_procs, and the information that was put into the block is then used by our kernel process function to actually initialize the stack size, priority and start location of the function. The data structure that is used is a basic array of PROC\_INIT that can be written to by the userthen read by the kernel.
+
+\subsubsection{MEMORY\_BLOCK g\_timer\_count}\label{gtimercount}
+  This global variable is a statically allocated memory block to allow the timer interrupt process to continue sending messages (to decrement send\_delaye\_message timers) even when the system blocks on memory. This is required to be global, as the process that recieves that message needs to ensure that it is not released. The data structure that is used for this is a basic MEMORY\_BLOCK, with a signal stored in mText[] to indicate whether the block is "in use".
+
+
+\newpage
+\section{Kernel API}\label{api}
+\subsection{request\_memory\_block}\label{requestmemoryblockf}
+  This function provides a memory block of size $0x80$ that processes can request to use for storage and to send messages to other processes. If there is no more memory to allocate it blocks on memory until there is memory available. Proper use of the function looks like the following:
+  \begin{lstlisting}
+  void* memory_block = request_memory_block();
+  // do stuff with memory_block
+  \end{lstlisting}
+  Cleanup that is required afterwards is to call release\_memory\_block with the memory block that was allocated as long as the block was not sent to another process, as that means the other block should call release\_memory\_block.
+\subsection{release\_memory\_block}\label{releasememoryblockf}
+  This function returns a memory block back to the memory queue so that it can be used by other processes. If this is called and there is another process with higher priority that is blocked on memory, the current process will preempt and the other process will run. Proper use of this function looks like the following:
+  \begin{lstlisting}
+release_memory_block(memory_block);
+  \end{lstlisting}
+  There is no cleanup that is required after this function, but before running this function, it should be ensured that this memory block needs to be released by the current process (and that the current process is the owner).
+\subsection{release\_processor}\label{releaseprocessorf}
+  This function tells the processer that the current process does not need to compute anymore, and should context switch to another process. Of note is that the current process my get the processer again later, so it should be called in an infinte loop if the process has completed. Proper use of the function looks like the following:
+  \begin{lstlisting}
+  \code that is important
+  release_processor()
+  \more code
+  while(1)
+    release_processor()
+  \end{lstlisting}
+  There is no cleanup required after this function, although as stated above, code will run afterwards, so it should either be looped or used before other code.
+\subsection{set\_process\_priority}\label{setprocesspriorityf}
+  This function changes the priority of a process to a priority thats passed in. It returns an integer (RTX\_ERR or RTX\_OK) to indicate whether the the change was successful. The process needs to be between 1 and 10 (so that the user does not change system process priorities), and the priority needs to be between 1 and 4 (corresponding to HIGH and LOWEST, respectively). Proper use of the function looks like the following:
+  \begin{lstlisting}
+    int ret = set_process_priority(1, 3);
+    if (ret == RTX_OK)
+      // do stuff
+  \end{lstlisting}
+
+  There is no cleanup required after use of this method, though verification of success may be useful.
+
+\subsection{get\_process\_priority}\label{getprocesspriorityf}
+  This function returns the priority of a process, and can be used for verifiying a process priority change. Proper use is as follows:
+  \begin{lstlisting}
+    set_process_priority(1, HIGH)
+    if (get_process_priority(1) != HIGH)
+      // oh no, priority didn't change
+  \end{lstlisting}
+
+\subsection{send\_message}\label{sendmessagef}
+  This function sends a message to another process, and takes in a memory block and the process to which the message should be sent. Of note, the memory block that is allocated to send should not be released in the current process, but in the process that receives it. This can cause preemption if the process that the message is sent to is blocked on receive and has a higher priority. Proper usage looks like the following:
+
+  \begin{lstlisting}
+    void* message_block = request_memory_block();
+    send_message(2, message_block)
+    // DO NOT RELEASE message_block
+  \end{lstlisting}
+
+  There should explicitly not be any cleanup done after this method, of note, the memory block that is sent should not be released.
+\subsection{receive\_message}\label{receivemessagef}
+  This is the process that pairs with \verb|send_message|, and can be called in a process to receive any messages that are sent. A pointer to an integer can be passed in to find out what the process that sent the message was. Proper usage looks like the following:
+  \begin{lstlisting}
+  int sender_id;
+  void* message_block = receive_message(&sender_id)
+  if (sender_id == 2)
+    // do something
+  \end{lstlisting}
+
+  Cleanup that is required after this is called is to release the message block that is passed in, as ownership is passed to the new process.
+\subsection{delayed\_send}\label{delayedsendf}
+  This is a function that sends a message to another process, after waiting for a delay (in mlliseconds) that is sent in as a parameter. If the time is 0, then it is the same as \verb|send_message|. Proper usage looks like the following:
+
+  \begin{lstlisting}
+    void* message_block = request_memory_block();
+    // send after 100ms delay
+    delayed_send(2, message_block, 100)
+    // do not release message block
+  \end{lstlisting}
+  There should explicitly not be any cleanup done after this method, of note, the memory block that is sent should not be released.
+
+  \newpage
+\section{Interrupts and Interrupt Handlers}\label{interrupts}
+The kernel handles two interrupts, namely the timer interrupt from the hardware clock and the UART interrupt.
+
+\subsubsection{Timer Interrupt}\label{timeri}
+The timer interrupt is called whenever the hardware clock ticks (the tick rate is approximately once per millisecond, or 1000Hz). The timer process has the exclusive use of a block of memory to use as a message envelope, which it requests when the timer is initialized (this message has the type TIMER\_SIGNAL\_STATIC\_MEM). Exclusive use is achieved by having the timer process create the memory block on the kernel stack, rather than requesting it from the shared memory pool via \verb|request_memory_block| (\ref{requestmemoryblockf}). The timer interrupt handler then increments the global time counter (\verb|g_timer_count|, \ref{gtimercount}) and sends a message to the timer handler process using this block, or by requesting a new block from the memory pool if the dedicated block is still busy being handled (indicated by a message field value of 1). The timer handler process maintains a list of messages that were sent with \verb|delayed_send| (\ref{delayedsendf}), and upon receipt of a message from the timer interrupt handler will decrement the time to send of each of these messages by 1, and send those messages that have come due. It then clears the use flag on the dedicated memory block if it was used, and returns. To queue up delayed messages, we arbitrarily chose to use the PID of the KCD process; if the message was sent to the timer from the KCD process, then it is queued for future sending. In pseudocode, the timer interrupt handler looks like this:
+\begin{lstlisting}
+acknowledge and clear timer interrupt
+increment global time counter by 1
+p_message = get dedicated memory block
+if(p_message.message == busy) {
+  p_backup = request_memory_block()
+  send_message(TIMER_PID, TIMER_PID, p_backup)
+}
+else {
+  // (sender, receiver, message)
+  send_message(TIMER_PID, TIMER_PID, p_message)
+}
+\end{lstlisting}
+
+and the timer handling process looks like:
+\begin{lstlisting}
+while (true) {
+  p_queue = list of delayed send messages
+  p_message = receive_message()
+  if(p_message was from TIMER_PID) {
+    for each message m in p_queue {
+      decrement m's time to send by 1
+      if(m's time to send <= 0)
+        send_message(m)
+    }
+  }
+  else if(p_message was from KCD_PID) {
+    add p_message to p_queue
+  }
+
+  if(p_message is reserved block)
+    clear use flag from p_message
+  else
+    release_memory(p_message)
+}
+\end{lstlisting}
+
+\subsubsection{UART Interrupt}\label{uarti}
+The UART interrupt is used when console input happens. The UART process is initialized on startup, but this is only to ease compatibility with the message passing infrastructure; there is no real process that runs, unlike with the timer interrupt. Whenever a character is typed, the UART interrupt checks to see if it is one of !, \#, or \$. If it is, the interrupt handler compiles and outputs debug information about processes that are in the ready queues, blocked on memory, or blocked on receive, respectively. If it is not, then the interrupt handler sends the KCD (\ref{KCDp}) a message with the typed character as its content for further processing\slash routing. When we are interrupted with IIR\_IntId \& IIR\_THRE , it means a character has finished printing, and that we need to inform the CRT to increment the character and continue printint if there is a message to be printed.
+
+
+\newpage
+\section{System and User Processes}\label{processes}
+The kernel runs both system and user processes. System processes run in kernel mode and have access to all privileges, while the user processes run with restricted privileges and must call into the kernel API to execute any privileged tasks (e.g. to receive memory). The user processes as a general rule tend to produce output, do computation, or do some other useful task, while the system processes are there to manage the system and run the kernel.
+
+The kernel has four (actually five; the null process has a special priority. See \ref{nullp}) priority levels for processes: HIGH, MEDIUM, LOW, and LOWEST. All processes on the system are assigned one of these four priority levels, and this level can change over the life of the process. As mentioned, the only exception is the null process, which has an immutable priority of LOWEST + 1 (in other words, lower than LOWEST). The null process is the only process with this special priority. Processes are given the processor according to their priority, with HIGH having priority over MEDIUM having priority over LOW having priority over LOWEST. Ties in priority are broken on a first-come, first-serve basis. For example, if the processor becomes available and there are two MEDIUM priority processes and one LOW priority process waiting for the processor, the MEDIUM process that was waiting first will be assigned the processor.
+
+A list of user and system processes follows, along with a brief description of each.
+
+\subsection{System Processes}\label{systemp}
+\subsubsection{Null Process}\label{nullp}
+The null process is the process that the system runs whenever no other processes can be run. It has the absolute lowest priority in the system (lower than LOWEST), which cannot be changed. It is the only process with this priority. This ensures that the null process, and only the null process, can run when no other processes can be run. The null process simply attempts to release the processor in an infinite loop, equivalent to the following pseudocode:
+\begin{lstlisting}
+while(true) {
+  release_processor()
+}
+\end{lstlisting}
+
+This means that the null process runs only until any other process becomes available to run.
+
+\subsubsection{CRT} \label{CRTp}
+This process handles displaying characters to the screen. It is a system level process that utilizes message passing and interrupt based printing to output messages to the screen. It functions by always listening for messages, with different cases for who the message is from. If the message was sent from the I\_UART, it means that a character was printed, and that we should increment, and try to print the next character; otherwise, it means that a new message was added that needs to be printed. The code for this works as follows:
+
+\begin{lstlisting}[breaklines=true]
+while(true)
+  message = receive_message(sender_id)
+    if (sender_id == UART)
+      if (not at string end)
+        set_bits_to_print
+      else
+        currently_printing = next_block
+        release_message_block(formerly_printing)
+        set_bits_to_print
+        incrementChar
+    else
+      add_to_queue(message)
+\end{lstlisting}
+
+\subsubsection{KCD} \label{KCDp}
+This process handles the routing of console input and key command registration. If the user types in \% followed by a letter and perhaps some additional data, this information should be routed to a specific process that has registered itself to handle that specific letter. This registration is achieved by having the process in question send this process a message of type KCD\_REG, and with the message text containing \% and the letter they wish to register to. The KCD then registers the sending process as the handler of the particular letter command that it requested. If future console input starts with \textit{\%letter}, then this process determines which process registered itself to handle the particular \textit{letter}, and sends it the entire line of console input for further processing. Furthermore, for all console input, this process sends a message containing the input to the CRT process (\ref{CRTp}) so that the input can be printed to the screen. In essence, this process is  that is responsible for routing console input to the correct process(es), as well as causing them to be printed. Note that this process receives input character by character, so it maintains a buffer of seen characters so far and sends each individual character to the CRT for display. Once the input character is a carriage return, this process sends the built-up buffer to the handling process if the first character in the buffer is \%, otherwise it discards it. It is equivalent to the following pseudocode:
+\begin{lstlisting}[breaklines=true]
+buffer = char array // declaration, this is always reused
+  while (true) {
+  message = receive_message()
+  if(message is of type KCD_REG) {
+    sender_pid = message.sender
+    command_letter = message.commandLetter // in the real code, we have to search the message string to find this, but this process is omitted here for simplicity.
+    handlers.add(sender_pid, command_letter) // registers sender_pid as the handler of command_letter commands
+    release_memory(message)
+  }
+  else {
+    // in this case the message contains console input
+    crt_message = request_memory_block()
+    crt_message <- message.character // duplicate the message to send to CRT
+    send_message(CRT_PID, message) // this is a single character
+
+    if(message.character is not carriage return) {
+      buffer.add(message.character)
+    }
+    else if(buffer starts with %) {
+      command_letter = message.text[1]
+      handler_pid = handlers.find(command_letter)
+      command_message = request_memory_block()
+      command_message <-  message // duplicate the message (text) for the handler process
+      send_message(handler_pid, command_message)
+      buffer.reset;
+    }
+    else {
+      buffer.reset
+    }
+  }
+}
+release_memory_block(message)
+\end{lstlisting}
+
+\subsection{User Processes}\label{userp}
+
+Note: All processes listed under test processes below are user processes that were written by us.
+\subsubsection{Wall Clock}\label{wallclockp}
+The wall clock is ussed to print the time out to the CRT every second. This user process sits in an infinite loop waiting for messages. If a message comes in from the KCD, it is indicating that someone has sent a command to either start or stop or modify the clock. It reads the message there and then performs the requested action. Otherwise, if the message was from itself, it means that the timer needs to be incremented and printed, and it completes that action.
+
+\begin{lstlisting}[breaklines=true]
+while(true)
+  p_message = receive_message(sender_id)
+  if (sender_id == KCD)
+    switchChar = p_message->text[1]
+    if (switchChar == R)
+      time = 0;
+      started = true;
+      // delay for 1 second
+      msg = request_memory_block()
+      send_delayed_message(self,msg, 1000);
+    else if (switchChar == S)
+      time = convert_text_to_time
+      //delay for 1 second
+      msg = request_memory_block()
+      send_delayed_message(self, msg, 1000)
+    else if (switchChar == T)
+      started = false;
+  else
+    print_time_to_CRT
+    time++
+    send_delayed_message(self, msg, 1000)
+
+\end{lstlisting}
+
+\subsubsection{Set Priority} \label{setpriorityp}
+The set priority process allows a user to type a command into the terminal in order to change the priority of a process. It does this by registering itself to the KCD, and then upon recieving a message from the KCD decipher's it to change priority of a process. If invalid, it prints that the command was not valid, otherwise, it complete's its actions silently.
+
+\begin{lstlisting}[breaklines=true]
+reg_msg = request_memory_block()
+req_msg->mtext = "%C"
+send_message(CRT, req_msg)
+while(true)
+  msg = request_message()
+  // this changes based on their input, but mtext[3] and 5 are used here as an example
+  proc_to_change = msg->mtext[3]
+  new_priority = msg->mtext[5]
+  result = set_process_priority(proc_to_change, new_priority)
+
+  if (result = RTX_ERR)
+    req_msg = request_memory_block()
+    req_msg->mtext = "Error changing priority.\r\n"
+    send_message(CRT, req_msg)
+\end{lstlisting}
+
+\subsubsection{Stress Tests} \label{stressp}
+This is in fact a collection of three processes working together in order to stress test the memory allocation and message passing functionality of the kernel. The three processes are implemented exactly following the requirements in the lab manual; refer to lab manual section 3.3.4 in  for further details. These processes utilize a large amount of memory allocation, message(and delayed message) passing and preemption to perform their operations.
+
+\newpage
+\section{Testing Methods and Methodology}\label{testing}
+
+Testing was an iterative process, that was done at each step of the process, whenever new processes were created. Testing was done by creating user processes that utilized any new system calls that were created in various different scenarios. We also tested different priorities and user input manually. The testing that was done was a combination of manual an automated testing, with a growing automated test bank that grew on every new system call that was created. Manual testing was also done to test the effect of different priorities and inputs to these automated tests.
+
+One tool that was commonly utilied was the debugger, which was utlilized whenever there was unexpected beheviour/ output. The debugger allowed us to step through system calls, and interupts with our tests, and find exactly where issues occured. For example, the debugger allowed us to diagnose an issue where the wrong buffer was being written to due to a lack of stack size.
+
+The following is a set of all methods we used to test our kernel code. We grouped test cases together, and ran different cases to test kernel processes.
+\subsection{Test Processes}\label{tstProcs}
+
+\subsubsection{alphabet}\label{alphabetp}
+This process repeatedly prints the letters of the alphabet, in order, to UART1 in an infinite loop. After ``Z'' is printed, it prints a new line, waits for a short amount of time, and then releases the processor. It is equivalent to the following pseudocode:
+\begin{lstlisting}
+while(true) {
+  while(whole alphabet not printed){
+    print(next letter of alphabet)
+  }
+  print_uart1(new line)
+  delay()
+  release_processor()
+}
+\end{lstlisting}
+
+\subsubsection{numbers}\label{numbersp}
+This process is the same as \verb|alphabet| (\ref{alphabetp}), except it repeatedly prints the numbers from 0 to 9 to UART1 instead of the letters of the alphabet, with a slight delay between each number. It is equivalent to the following pseudocode:
+\begin{lstlisting}
+while(true) {
+  for(i = 0 to 9) {
+    print(i)
+    delay()
+  }
+  print_uart1(new line)
+  delay()
+  release_processor()
+}
+\end{lstlisting}
+
+\subsubsection{fibonacci}\label{fibonaccip}
+This process prints the numbers of the Fibonacci sequence to UART1, in order, with a slight delay between each number. After each number is printed, it releases the processor. It is equivalent to the following pseudocode:
+
+\begin{lstlisting}
+n = 0
+while(true) {
+  print(nth fibonacci number)
+  n++
+  delay()
+  release_processor()
+}
+\end{lstlisting}
+
+\subsubsection{mem\_proc} \label{memprocp}
+This process repeatedly requests and then immediately releases 30 memory blocks, then releases the processor. It is equivalent to the following pseudocode:
+\begin{lstlisting}
+while(true) {
+  memory_array = request(30 memory blocks)
+  release(memory_array)
+  delay()
+  release_processor()
+}
+\end{lstlisting}
+
+\subsubsection{priority\_set}\label{prioritysetp}
+This process sets the priority of the process with process ID 1 to HIGH (this is usually itself), then releases the processor. The pseudocode is omitted.
+
+\subsubsection{memory\_hog}\label{memoryhogp}
+This process requests memory blocks in an infinite loop, never releasing any of them. It does NOT release the processor: therefore, this process will request all currently available memory when it runs and will only release the processor once it blocks itself waiting for memory. This process is mostly used for testing purposes. It is equivalent to the following pseudocode:
+\begin{lstlisting}[breaklines=true]
+while(true) {
+  request_memory_block() // note that the return value is never stored anywhere, and is therefore leaked memory.
+}
+\end{lstlisting}
+
+\subsubsection{memory\_user\_priority\_setter}\label{mupsp}
+This process is very similar to \verb|mem_proc|, except that after it requests the 30 memory blocks, it sets its own priority to LOW. This process then releases the 30 memory blocks, then sets its priority to HIGH and prints a diagnostic message. It then permanently tries to release the processor. This process is intended to test the system while memory is being held and slowly released back into the free list. It is equivalent to the following pseudocode:
+\begin{lstlisting}
+my_mem = request 30 memory blocks
+set_process_priority(self, LOW)
+for (i = 0; i < 30; i++) {
+  release_memory_block(my_mem[i])
+  my_mem[i] = NULL
+}
+set_process_priority(self, HIGH)
+
+print_uart1("Some memory was taken used and freed up.\r\n")
+
+while (true) {
+  release_processor()
+}
+\end{lstlisting}
+
+\subsubsection{sends\_messages}\label{sendsp}
+This process sends messages, and is intended to be used in conjunction with \verb|receives_messages| (\ref{receivesp}). It requests six memory blocks to use as message envelopes, exploits the memory block to print a diagnostic message to UART1, and then sets the message to be the letter a + some a changing offset so that the messages sent to different processes have different messages. The process then sends the message to the process with PID i (i being the loop index, ranging from 1 to 6), and loops around to repeat the process for the next message. After all six messages are sent, the process sets its own priority to LOWEST, and releases the processor. It is equivalent to the following pseudocode (that is basically the real code we used):
+\begin{lstlisting}
+int i;
+for (i = 1; i <= 6; i++) {
+  char* s = "Sending to PID: ";
+  int j = 0;
+  MSGBUF* p_envelope = request_memory_block();
+  p_envelope->mtype = DEFAULT;
+  while (*s) {
+    p_envelope->mtext[j++] = *(s++);
+  }
+
+  p_envelope->mtext[j++] = '0' + i;
+  p_envelope->mtext[j++] = '\r';
+  p_envelope->mtext[j++] = '\n';
+  p_envelope->mtext[j++] = 0;
+
+  print_uart1(p_envelope->mtext);
+
+  p_envelope->mtext[0] = 'a' + i * 4;
+  p_envelope->mtext[1] = '\r';
+  p_envelope->mtext[2] = '\n';
+  p_envelope->mtext[3] = 0;
+
+  send_message(i, p_envelope);
+}
+set_process_priority(self, LOWEST);
+
+while (true) {
+  release_processor();
+}
+\end{lstlisting}
+
+\subsubsection{receives\_messages}\label{receivesp}
+This process receives messages, and is meant to be used with \verb|sends_messages| (\ref{sendsp}). It blocks until it receives a message (usually sent from \verb|sends_messages|), then prints out the PID of the sending process and the contents of the message to UART1. It then releases the memory block used to send the message, sets its own priority to LOWEST, and releases the processor. It is equivalent to the following pseudocode (that is again basically the real code we used):
+
+\begin{lstlisting}
+int sender_id;
+MSGBUF* p_envelope = receive_message(&sender_id);
+print_uart1("Received message from PID ");
+print_uart1('0' + sender_id);
+print_uart1("\r\n");
+print_uart1("Message contents: ");
+print_uart1(p_envelope->mtext);
+
+release_memory_block(p_envelope);
+
+set_process_priority(self, LOWEST);
+
+while (1) {
+  release_processor();
+}
+\end{lstlisting}
+
+\subsubsection{sends\_CRT\_messages}\label{sendsCRTp}
+This process is essentially the same as \verb|sends_messages| (\ref{sendsp}) but sends the messages exclusively to the CRT process (\ref{CRTp}) rather than to other processes. In this case, the process sends the message ``SENDING MESSAGE TO CRT: *num*'', where num is a number between 1 and 7. It then sets its own priority to LOWEST and releases the processor. This process is mainly used to exercise the CRT process. It is equivalent to the following ``pseudo''code:
+\begin{lstlisting}
+int i;
+for (i = 1; i <= 7; i++) {
+  char* s = "SENDING MESSAGE TO CRT: ";
+  int j = 0;
+  MSGBUF* p_envelope = request_memory_block();
+  p_envelope->mtype = DEFAULT;
+  while (*s) {
+    p_envelope->mtext[j++] = *(s++);
+  }
+
+  p_envelope->mtext[j++] = '0' + i;
+  p_envelope->mtext[j++] = '\r';
+  p_envelope->mtext[j++] = '\n';
+  p_envelope->mtext[j++] = 0;
+
+  send_message(PID_CRT, p_envelope);
+}
+
+set_process_priority(self, LOWEST);
+
+while (1) {
+  release_processor();
+}
+\end{lstlisting}
+
+\subsubsection{sends\_delayed\_messages}\label{sendsdelayedp}
+This process sends delayed messages to itself in order to exercise the delayed message sending functionality (see \ref{delayedsendf} for more details). It requests two memory blocks to use for messages, and sends one of them to itself with a half-second delay and the other with a full second delay. The process then waits to receive the messages it sent to itself, and then requests memory blocks to hold a message to print to the terminal via the CRT (\ref{CRTp}). The process sends the appropriate message to the CRT, and then resends itself the appropriate delayed message. This means that the process will continually send and receive the original messages for its entire lifetime. It is equivalent to the following pseudocode:
+
+\begin{lstlisting}[breaklines=true]
+p_envelope_half = message envelope for half second delay
+p_envelope_full = message envelope for full second delay
+delayed_send(self, p_envelope_half, 500);
+delayed_send(self, p_envelope_full, 1000);
+
+while (true) {
+  p_envelope = receive_message();
+  if (p_envelope is half second message) {
+    p_print_msg = message envelope for CRT message;
+    p_print_msg.setMessage("Half second delayed message")
+
+    send_message(PID_CRT, p_print_msg);
+    delayed_send(self, p_envelope, 500);
+  } else {
+    p_print_msg = message envelope for CRT message;
+    p_print_msg.setMessage("Full second delayed message")
+
+    send_message(PID_CRT, p_print_msg);
+    delayed_send(self, p_envelope, 1000);
+  }
+}
+\end{lstlisting}
+
+
+
+\newpage
+\section{Timing and Performance Metrics}\label{metrics}
+  \paragraph{Design} Our experiment consisted of three different processes in user\_procs.c , one for each of the methods to time (send\_message, receive\_message and request\_memory\_block), that checked the TC before the function call and after the function call then printed the difference between the two values, pseudo code is shown below. In order to allow this to work, we had to change timer.c. Firstly, we used the second clock on the board (LPC\_TIM1), changed the PR(Prescale Register) to 12 (approximately 1 microsecond), and removed the call to reset TC based on value in MR0. Each of the processes in user\_procs was set to a priority of high to prevent any preemption issues and all the only method that was run between the two checks of TC were the methods in question.
+
+  \begin{lstlisting}
+    // testing send_message
+    msg = request_message_block()
+    time1 = checkTC
+    send_message(msg, 1)
+    time2 = checkTC
+    print(time2-time1)
+  \end{lstlisting}
+
+  \begin{lstlisting}
+    // testing receive_message
+    msg = request_message_block()
+    send_message(msg, 1)
+    time1 = checkTC
+    msg = receive_message(NULL)
+    time2 = checkTC
+    print(time2-time1)
+  \end{lstlisting}
+
+  \begin{lstlisting}
+    // testing request_memory_block
+    time1 = checkTC
+    msg = request_message_block()
+    time2 = checkTC
+    print(time2-time1)
+  \end{lstlisting}
+
+  \paragraph{Results} The results obtained showed that for send\_message, the time to complete the operation given no other processes running and having highest priority was 3 microseconds(~36 clock cycles). For receive\_message the time required to compete the operation was also 3 microseconds (~36 clock cycles). For request\_memory\_block, the time for the operation to complete was 4 microseconds(~48 clock cycles).
+
+  \paragraph{Analysis} These results are reasonable for the operations. This is because for send\_message there was no message queue to pass through, and it was just added to the front (a fast operation). If there were a large memory queue this operation could take longer. The same applies to receive\_message, as there was no need to pop from the list, and all that was done was read from the top message. A long message queue would mean that this would need to be pulled from the front, and the new front would be changed. Request\_memory\_block should always take approximatly this much time as there is pre-computation done to build the blocks.
+\newpage
+\section{Major Design Changes}\label{designChanges}
+
+\quad Overall throughout the process of creating the kernel, there were not many major design changes to our kernel. One change that was made, however, was a change in the way that the kernel handled memory blocks, and what information was available for the kernel to use. In the initial version of the kernel for the first deadline, before allocating memory, we used a small header in the memory blocks to create a linked list structure of free memory blocks. However, once a user requested a memory block, we thought that we did not have to keep track of it anymore, and overwrote this. However, we realized that we would need access to a header in order for the kernel to implement message passing, and create a queue of messages that were waiting for a process to receive. This meant changing the size of a memory block (but not the amount available to a user), and then accessing the header that the users did not have access to.
+
+\quad One major stumbling block that we faced was the iterative nature of the design. At the end of every deliverable deadline, we would treat that as a "finished" product, which meant that when we tried to add new features for the next deliverable, we would sometimes have to patch issues we didn't think we would have to face. This made design and implementation much more difficult, and increased the complexity of the kernel. Another stumbling block faced was the differences between the board and the simulation, as often we would be able to run it without issues on the simulation, and then have issues on the board, that would then have to be debugged.
+
+\quad Something we would have done if we started over would be to look at all of the deliverables that we would have to create at the start of the project, and create a complete plan of the entire kernel, how different processes would interact with each other (at a high level) and then complete the lower level design we created for each individual deliverable. Another thing that we would have done is created a separate amount of "kernel memory" for the kernel processes to use in the background, as that would prevent the issues we faced with kernel processes also being blocked on memory. Finally, we would also created an abstract structure that could create a linked list of memory blocks, as we found we had to recreate that several times for different processes.
+
+\quad One design issue our OS had was some system process also relying on request\_memory\_block, meaning that they could get blocked on memory, and stop the system from moving forward (i.e. delayed messages wouldn't count down).
+\end{document}

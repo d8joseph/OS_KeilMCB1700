@@ -1,0 +1,17 @@
+{
+  "folders":
+  [
+    {
+     "path": ".",
+     "file_exclude_patterns": ["*.sublime-workspace", "*.crf", "*.d", "*.htm*", "*.dep", "*.bak", "*.uv*", "*.tra", "*.plg", "*.sct", "*.map", "*.lnp", "*.axf", "*.__i"],
+     "folder_exclude_patterns": []
+    }
+  ],
+  "settings":
+  {
+  	"ensure_newline_at_eof_on_save": true,
+  	"tab_size": 2,
+  	"trim_trailing_white_space_on_save": true,
+  	"translate_tabs_to_spaces": true
+  }
+}
